@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Remember where floating windows were, per app, and put them back on open.
+
+Hyprland 0.57 has no event for a window being moved or resized, so the
+geometry of floating windows is sampled every couple of seconds. For each app
+(window class) only its first floating window is remembered, so dialogs it
+opens later do not overwrite the main window's spot. When an app opens a
+floating window and none of its windows is already floating, the saved
+position and size are applied, on the same monitor, clamped to fit.
+
+State: ~/.local/state/omarchy/float-positions.json
+"""
+import json
+import os
+import socket
+import subprocess
+import time
+
+STATE = os.path.expanduser("~/.local/state/omarchy/float-positions.json")
+SAMPLE_EVERY = 2.0      # seconds between geometry samples
+RESTORE_DELAY = 0.35    # let Omarchy place the window first, then override
+SKIP_CLASSES = {""}     # windows without a class are never touched
+
+
+def hyprctl_json(what):
+    out = subprocess.run(["hyprctl", "-j", what], capture_output=True, text=True, timeout=5)
+    return json.loads(out.stdout or "[]")
+
+
+def dispatch(expr):
+    subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, timeout=5)
+
+
+def load():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save(data):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1, sort_keys=True)
+    os.replace(tmp, STATE)
+
+
+class Memory:
+    def __init__(self):
+        self.saved = load()
+        self.owner = {}       # class -> address of the window whose spot we keep
+        self.pending = {}     # address -> time to try restoring it
+
+    def monitors(self):
+        return {m["id"]: m for m in hyprctl_json("monitors")}
+
+    def sample(self):
+        clients = hyprctl_json("clients")
+        mons = self.monitors()
+        alive = {c["address"] for c in clients}
+        # Forget owners whose window is gone, so the next window of that app can own it.
+        for cls, addr in list(self.owner.items()):
+            if addr not in alive:
+                del self.owner[cls]
+        changed = False
+        for c in clients:
+            cls = c.get("class", "")
+            if cls in SKIP_CLASSES or not c.get("floating") or c.get("fullscreen"):
+                continue
+            if not c.get("mapped", True) or c.get("hidden"):
+                continue
+            if c["address"] in self.pending:
+                continue  # not restored yet; its current spot is Omarchy's default
+            owner = self.owner.setdefault(cls, c["address"])
+            if owner != c["address"]:
+                continue
+            mon = mons.get(c.get("monitor"))
+            if not mon:
+                continue
+            entry = {
+                "monitor": mon["name"],
+                "x": c["at"][0] - mon["x"],
+                "y": c["at"][1] - mon["y"],
+                "w": c["size"][0],
+                "h": c["size"][1],
+            }
+            if self.saved.get(cls) != entry:
+                self.saved[cls] = entry
+                changed = True
+        if changed:
+            save(self.saved)
+
+    def opened(self, address):
+        self.pending[address] = time.monotonic() + RESTORE_DELAY
+
+    def restore_due(self):
+        now = time.monotonic()
+        due = [a for a, t in self.pending.items() if t <= now]
+        if not due:
+            return
+        clients = {c["address"]: c for c in hyprctl_json("clients")}
+        mons_by_name = {m["name"]: m for m in hyprctl_json("monitors")}
+        for addr in due:
+            del self.pending[addr]
+            c = clients.get(addr)
+            if not c or not c.get("floating") or c.get("fullscreen"):
+                continue
+            cls = c.get("class", "")
+            entry = self.saved.get(cls)
+            if cls in SKIP_CLASSES or not entry:
+                continue
+            # Another floating window of this app already open: leave this one be.
+            if any(o["address"] != addr and o.get("class") == cls and o.get("floating")
+                   for o in clients.values()):
+                continue
+            mon = mons_by_name.get(entry["monitor"])
+            if not mon:
+                continue  # that monitor is not connected now
+            mw = int(mon["width"] / mon["scale"])
+            mh = int(mon["height"] / mon["scale"])
+            w = max(100, min(entry["w"], mw))
+            h = max(80, min(entry["h"], mh))
+            x = mon["x"] + max(0, min(entry["x"], mw - w))
+            y = mon["y"] + max(0, min(entry["y"], mh - h))
+            sel = f'"address:{addr}"'
+            dispatch(f"hl.dsp.window.resize({{ x = {w}, y = {h}, relative = false, window = {sel} }})")
+            dispatch(f"hl.dsp.window.move({{ x = {x}, y = {y}, relative = false, window = {sel} }})")
+            self.owner[cls] = addr
+
+
+def main():
+    sig = os.environ["HYPRLAND_INSTANCE_SIGNATURE"]
+    path = os.path.join(os.environ["XDG_RUNTIME_DIR"], "hypr", sig, ".socket2.sock")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    sock.settimeout(0.2)
+    mem = Memory()
+    mem.sample()
+    buf = b""
+    next_sample = time.monotonic() + SAMPLE_EVERY
+    while True:
+        try:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise SystemExit("Hyprland closed the event socket")
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                event, _, data = line.decode(errors="replace").partition(">>")
+                if event == "openwindow":
+                    mem.opened("0x" + data.split(",", 1)[0])
+                elif event == "changefloatingmode":
+                    addr, _, mode = data.partition(",")
+                    if mode == "1":
+                        mem.opened("0x" + addr)
+        except socket.timeout:
+            pass
+        mem.restore_due()
+        if time.monotonic() >= next_sample:
+            mem.sample()
+            next_sample = time.monotonic() + SAMPLE_EVERY
+
+
+if __name__ == "__main__":
+    main()
