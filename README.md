@@ -12,13 +12,19 @@ Background: [omacom/omarchy discussion #17876](https://github.com/omacom/omarchy
 - Remembers the last floating geometry of each app (window class): the monitor,
   the position relative to that monitor, and the size.
 - When that app opens a floating window again, or one of its windows is
-  floated, it puts it back there, right after Omarchy has placed it.
+  floated, it puts it back with that size and position, right after Omarchy
+  has placed it.
+- It stays on the monitor the window opens on, which is the one you are
+  working on. A spot saved on the other monitor is carried over
+  proportionally.
 - Only the first floating window of an app is tracked, so dialogs (Save, Open)
   don't overwrite the main window's spot. A second window of the same app keeps
   Omarchy's default placement.
-- If the saved monitor isn't connected, it does nothing. The geometry is
-  clamped to the monitor, so a window never lands off-screen.
-- Tiled windows are never touched.
+- The geometry is clamped to the part of the monitor clear of bars, so a
+  window never lands off-screen or with its title bar under the top bar.
+- Tiled windows are never touched, and neither are Omarchy shell plugin
+  windows (`org.quickshell`), file dialogs (portals), Hyprland dialogs and
+  Folio's preview.
 
 State lives in `~/.local/state/omarchy/float-positions.json`.
 
@@ -47,7 +53,7 @@ rm -f ~/.local/state/omarchy/float-positions.json
 ## How it works
 
 - Listens on Hyprland's event socket (`.socket2.sock`) for `openwindow` and
-  `changefloatingmode`, waits ~350 ms so Omarchy's own placement runs first,
+  `changefloatingmode`, waits ~100 ms so Omarchy's own placement runs first,
   then dispatches `hl.dsp.window.resize(...)` and `hl.dsp.window.move(...)`
   with absolute coordinates.
 - Hyprland 0.57 has no event for a window being moved or resized, so the

@@ -6,7 +6,10 @@ geometry of floating windows is sampled every couple of seconds. For each app
 (window class) only its first floating window is remembered, so dialogs it
 opens later do not overwrite the main window's spot. When an app opens a
 floating window and none of its windows is already floating, the saved
-position and size are applied, on the same monitor, clamped to fit.
+position and size are applied on the monitor the window opened on (the one
+being worked on), scaled from the monitor it was saved on and clamped to fit.
+Shell surfaces (Quickshell plugin windows), portal file dialogs and other
+dialogs are never touched.
 
 State: ~/.local/state/omarchy/float-positions.json
 """
@@ -18,8 +21,27 @@ import time
 
 STATE = os.path.expanduser("~/.local/state/omarchy/float-positions.json")
 SAMPLE_EVERY = 2.0      # seconds between geometry samples
-RESTORE_DELAY = 0.35    # let Omarchy place the window first, then override
-SKIP_CLASSES = {""}     # windows without a class are never touched
+RESTORE_DELAY = 0.1     # Omarchy places the window as it opens; override just after
+# Never touched: windows without a class, Quickshell plugin windows (they all
+# share one class), file dialogs and other dialogs, previews.
+SKIP_CLASSES = {"", "org.quickshell", "hyprland-dialog", "folio-preview"}
+
+
+def skipped(cls):
+    return cls in SKIP_CLASSES or "portal" in cls.lower()
+
+
+def logical_size(mon):
+    return int(mon["width"] / mon["scale"]), int(mon["height"] / mon["scale"])
+
+
+def usable(mon):
+    """The part of a monitor windows may use, clear of bars, relative to the
+    monitor: (x, y, width, height). Hyprland lists reserved space as left,
+    top, right, bottom."""
+    mw, mh = logical_size(mon)
+    left, top, right, bottom = (list(mon.get("reserved") or []) + [0, 0, 0, 0])[:4]
+    return left, top, max(1, mw - left - right), max(1, mh - top - bottom)
 
 
 def hyprctl_json(what):
@@ -67,7 +89,7 @@ class Memory:
         changed = False
         for c in clients:
             cls = c.get("class", "")
-            if cls in SKIP_CLASSES or not c.get("floating") or c.get("fullscreen"):
+            if skipped(cls) or not c.get("floating") or c.get("fullscreen"):
                 continue
             if not c.get("mapped", True) or c.get("hidden"):
                 continue
@@ -79,8 +101,11 @@ class Memory:
             mon = mons.get(c.get("monitor"))
             if not mon:
                 continue
+            mw, mh = logical_size(mon)
             entry = {
                 "monitor": mon["name"],
+                "mw": mw,
+                "mh": mh,
                 "x": c["at"][0] - mon["x"],
                 "y": c["at"][1] - mon["y"],
                 "w": c["size"][0],
@@ -89,6 +114,9 @@ class Memory:
             if self.saved.get(cls) != entry:
                 self.saved[cls] = entry
                 changed = True
+        for cls in [k for k in self.saved if skipped(k)]:
+            del self.saved[cls]
+            changed = True
         if changed:
             save(self.saved)
 
@@ -101,7 +129,9 @@ class Memory:
         if not due:
             return
         clients = {c["address"]: c for c in hyprctl_json("clients")}
-        mons_by_name = {m["name"]: m for m in hyprctl_json("monitors")}
+        mons = hyprctl_json("monitors")
+        mons_by_id = {m["id"]: m for m in mons}
+        mons_by_name = {m["name"]: m for m in mons}
         for addr in due:
             del self.pending[addr]
             c = clients.get(addr)
@@ -109,21 +139,35 @@ class Memory:
                 continue
             cls = c.get("class", "")
             entry = self.saved.get(cls)
-            if cls in SKIP_CLASSES or not entry:
+            if skipped(cls) or not entry:
                 continue
             # Another floating window of this app already open: leave this one be.
             if any(o["address"] != addr and o.get("class") == cls and o.get("floating")
                    for o in clients.values()):
                 continue
-            mon = mons_by_name.get(entry["monitor"])
+            # Stay on the monitor the window opened on: the one being worked on.
+            mon = mons_by_id.get(c.get("monitor"))
             if not mon:
-                continue  # that monitor is not connected now
-            mw = int(mon["width"] / mon["scale"])
-            mh = int(mon["height"] / mon["scale"])
-            w = max(100, min(entry["w"], mw))
-            h = max(80, min(entry["h"], mh))
-            x = mon["x"] + max(0, min(entry["x"], mw - w))
-            y = mon["y"] + max(0, min(entry["y"], mh - h))
+                continue
+            # Only the area clear of bars counts, so the title bar is never
+            # hidden under the shell's top bar.
+            ux, uy, uw, uh = usable(mon)
+            w = max(100, min(entry["w"], uw))
+            h = max(80, min(entry["h"], uh))
+            if entry["monitor"] == mon["name"]:
+                x, y = entry["x"], entry["y"]
+            else:
+                # Saved on another monitor: keep the same place proportionally.
+                src = mons_by_name.get(entry["monitor"])
+                if src:
+                    sx, sy, sw, sh = usable(src)
+                else:
+                    sx, sy, sw, sh = 0, 0, entry.get("mw", uw), entry.get("mh", uh)
+                fx = (entry["x"] - sx) / max(1, sw - entry["w"])
+                fy = (entry["y"] - sy) / max(1, sh - entry["h"])
+                x, y = ux + round(fx * (uw - w)), uy + round(fy * (uh - h))
+            x = mon["x"] + max(ux, min(x, ux + uw - w))
+            y = mon["y"] + max(uy, min(y, uy + uh - h))
             sel = f'"address:{addr}"'
             dispatch(f"hl.dsp.window.resize({{ x = {w}, y = {h}, relative = false, window = {sel} }})")
             dispatch(f"hl.dsp.window.move({{ x = {x}, y = {y}, relative = false, window = {sel} }})")
